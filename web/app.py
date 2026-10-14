@@ -2,32 +2,21 @@ from flask import Flask, request, jsonify
 from flask_restful import Api, Resource
 from pymongo import MongoClient
 import bcrypt
-import numpy as np
-import requests
-
-from keras.applications import InceptionV3
-from keras.applications.inception_v3 import preprocess_input, decode_predictions
-from keras.utils import img_to_array
-from PIL import Image
-from io import BytesIO
 
 app = Flask(__name__)  # Initialize Flask app
 api = Api(app) # Initialize Flask-RESTful API
 
-# load the pre trained InceptionV3 model for image recognition
-pretrained_model = InceptionV3(weights='imagenet')  # Load pre-trained InceptionV3 model
-
 client = MongoClient('mongodb://db:27017/') # Connect to MongoDB (service name "db" in docker-compose)
-db = client['ImageRecognition']  # Database name
+db = client['BankAPI']  # Database name
 users = db['Users']  # Collection name
 
 def UserExist(username):  # Function to check if user exists
     if users.find_one({'username': username}):
         return True
     else:
-        return False    
+        return False
 
-class Register(Resource): # Define Register resource 
+class Register(Resource): # Define Register resource
     def post(self):
         # Get posted data from request
         postedData = request.get_json()  # Get JSON data from request
@@ -36,21 +25,22 @@ class Register(Resource): # Define Register resource
 
         if UserExist(username):
             return jsonify(
-                {'status': 301, 
+                {'status': 301,
                  'message': 'Invalid username, user already exists'
-                })  
+                })
 
         hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())  # Hash the password
-        
+
         # Store user data in the database
         users.insert_one({'username': username,
                            'password': hashed_pw,
-                           'Tokens': 4
+                           'Own': 0,
+                           "Debt": 0
                          })  # Insert user
         return jsonify(
-            {'status': 200, 
-             'message': 'You successfully signed up for the API' 
-            })  
+            {'status': 200,
+             'message': 'You successfully signed up for the API'
+            })
 
 def verifyPw(username, password):  # Function to verify password
     hashed_pw = users.find_one({'username': username})['password']  # Get hashed password from DB
@@ -59,122 +49,163 @@ def verifyPw(username, password):  # Function to verify password
     else:
         return False
 
-def countTokens(username):  # Function to count user tokens
-    tokens = users.find_one({'username': username})['Tokens']           
-    return tokens
+def cashWithUser(username):  # Function to get user's cash
+    cash = users.find_one({'username': username})['Own']  # Get user's cash from DB
+    return cash
 
-class Classify(Resource):  # Define Classify resource       
-    def post(self):
-        # Get posted data from request 
-        postedData = request.get_json()  # Get JSON data from request
-        username = postedData['username']
-        password = postedData['password']
-        url = postedData.get('url')  # Image URL (optional key so a missing field returns a message instead of a 500)
+def debtWithUser(username):  # Function to get user's debt
+    debt = users.find_one({'username': username})['Debt']  # Get user's debt from DB
+    return debt
 
-        if not UserExist(username):
-            return jsonify(
-                {'status': 301, 
-                 'message': 'Invalid Username'
-                })  
+def generateReturnDictionary(status, message):  # Function to generate return dictionary
+    retJson = {
+        "status": status,
+        "message": message
+    }
+    return retJson
 
-        hashed_pw = users.find_one({'username': username})['password']  # Get hashed password from DB
+def verifyCredentials(username, password):  # Function to verify user credentials
+    if not UserExist(username):
+        return generateReturnDictionary(301, "Invalid Username"), True  # User does not exist
 
-        if not bcrypt.checkpw(password.encode('utf-8'), hashed_pw):  # Check password
-            return jsonify(
-                {'status': 302, 
-                 'message': 'Invalid Password'
-                })  
+    correct_pw = verifyPw(username, password)  # Verify password
+    if not correct_pw:
+        return generateReturnDictionary(302, "Invalid Password"), True  # Invalid password
 
-        num_tokens = countTokens(username)  # Get user tokens
-    
-        if num_tokens <= 0:  # Check if user has enough tokens
-            return jsonify(
-                {'status': 303, 
-                 'message': 'Not enough tokens'
-                })  
+    return None, False  # Credentials are valid
 
-        # Classify the image using the pre-trained InceptionV3 model
-        try:
-            if not url:
-                return jsonify(
-                    {'status': 400, 
-                     'message': 'No URL provided'
-                    })
-            
-            # Load the image from the provided URL
-            response = requests.get(url, timeout=10)  # Fetch image from URL
-            response.raise_for_status()  # Fail early on HTTP errors instead of decoding an error page
-            img = Image.open(BytesIO(response.content)).convert('RGB')  # Open image (RGB: drops alpha / grayscale channels)
-            img = img.resize((299, 299))  # Resize image to match InceptionV3 input size
-            img_array = img_to_array(img)  # Convert image to array
-            img_array = np.expand_dims(img_array, axis=0)  # Expand dimensions for model input
-            img_array = preprocess_input(img_array)  # Preprocess image for InceptionV3
+def changeAccount(username, cash_delta, debt_delta=0):  # Function to change user's cash and debt by a relative amount
+    # $inc applies the change atomically and leaves the other fields (e.g. Debt) untouched
+    users.update_one(
+        {'username': username},
+        {'$inc': {'Own': cash_delta, 'Debt': debt_delta}
+        })
 
-            # Pre process the image and make predictions using the pre-trained InceptionV3 model
-            preds = pretrained_model.predict(img_array)  # Make prediction
-            results = decode_predictions(preds, top=5)  # Decode predictions
-
-            current_tokens = countTokens(username)  # Get current token count
-
-            ret_json = {}
-            for pred in results[0]:
-                ret_json[pred[1]] = float(pred[2]*100)  # Store predictions in JSON format
-
-            # ('952735', 'banana', 0.9999996423721313)
-            
-            users.update_one(
-                {'username': username}, 
-                {'$set': {'Tokens': current_tokens - 1}
-                })  # Deduct one token
-
-            return jsonify(
-                {'status': 200, 
-                 'predictions': ret_json,
-                 'message': 'Image classified successfully'
-                })  
-        except Exception as e:
-            return jsonify(
-                {'status': 305, 
-                 'message': f'Error processing image: {str(e)}'
-                })
-
-class Refill(Resource):  # Define Refill resource   
+class Add(Resource):  # Define Add resource
     def post(self):
         # Get posted data from request
         postedData = request.get_json()  # Get JSON data from request
         username = postedData['username']
-        password = postedData['admin_pw']
+        password = postedData['password']
         amount = int(postedData['amount'])  # Accept "200" or 200 in the JSON body
 
-        if not UserExist(username):
-            return jsonify(
-                {'status': 301, 
-                 'message': 'Invalid Username'
-                })  
+        retJson, error = verifyCredentials(username, password)  # Verify user credentials
+        if error:
+            return jsonify(retJson)  # Return error if credentials are invalid
 
-        correct_pw = 'abc123'  # Admin password
-        
-        if password != correct_pw:  # Check admin password
-            return jsonify(
-                {'status': 302, 
-                 'message': 'Incorrect Password'
-                })  
+        if amount <= 0:  # Check if amount is valid
+            return jsonify(generateReturnDictionary(304, "Invalid amount to add"))  # Invalid amount
 
-        current_tokens = countTokens(username)  # Get current token count
-        
-        users.update_one(
-            {'username': username}, 
-            {'$set': {'Tokens': current_tokens + amount}
-            })  # Refill tokens
+        changeAccount("BANK", -amount)  # Deduct amount from bank's cash
+        changeAccount(username, amount)  # Add amount to user's cash
 
-        return jsonify(
-            {'status': 200, 
-             'message': 'Refilled successfully'
-            })
+        return jsonify(generateReturnDictionary(200, "Amount added successfully to account"))
+
+class Transfer(Resource):  # Define Transfer resource
+    def post(self):
+        # Get posted data from request
+        postedData = request.get_json()  # Get JSON data from request
+        username = postedData['username']
+        password = postedData['password']
+        amount = int(postedData['amount'])  # Accept "200" or 200 in the JSON body
+        to = postedData['to']  # Recipient username
+
+        retJson, error = verifyCredentials(username, password)  # Verify user credentials
+        if error:
+            return jsonify(retJson)  # Return error if credentials are invalid
+
+        if not UserExist(to):
+            return jsonify(generateReturnDictionary(301, "Recipient username does not exist"))  # Recipient does not exist
+
+        if to == username:  # Sending to yourself would mix up the balances
+            return jsonify(generateReturnDictionary(306, "Cannot transfer to yourself"))  # Invalid recipient
+
+        if amount <= 0:  # Check if amount is valid
+            return jsonify(generateReturnDictionary(304, "Invalid amount to transfer"))  # Invalid amount
+
+        cash = cashWithUser(username)  # Get user's cash
+
+        if cash < amount:  # Check if user has enough cash
+            return jsonify(generateReturnDictionary(305, "Insufficient funds"))  # Insufficient funds
+
+        changeAccount("BANK", 1)  # Bank keeps a fee of 1
+        changeAccount(to, amount - 1)  # Recipient receives amount minus the fee
+        changeAccount(username, -amount)  # Deduct amount from user's cash
+
+        return jsonify(generateReturnDictionary(200, "Amount transferred successfully"))
+
+class Balance(Resource):  # Define Balance resource
+    def post(self):
+        # Get posted data from request
+        postedData = request.get_json()  # Get JSON data from request
+        username = postedData['username']
+        password = postedData['password']
+
+        retJson, error = verifyCredentials(username, password)  # Verify user credentials
+        if error:
+            return jsonify(retJson)  # Return error if credentials are invalid
+
+        # Return only the balance fields: the stored 'password' is a bcrypt hash in bytes,
+        # which jsonify cannot serialize (caused the 500) and must not be exposed anyway
+        retJson = users.find_one({'username': username}, {'_id': 0, 'username': 1, 'Own': 1, 'Debt': 1})
+
+        return jsonify(retJson)  # Return user balance as JSON
+
+class TakeLoan(Resource):  # Define TakeLoan resource
+    def post(self):
+        # Get posted data from request
+        postedData = request.get_json()  # Get JSON data from request
+        username = postedData['username']
+        password = postedData['password']
+        amount = int(postedData['amount'])  # Accept "200" or 200 in the JSON body
+
+        retJson, error = verifyCredentials(username, password)  # Verify user credentials
+        if error:
+            return jsonify(retJson)  # Return error if credentials are invalid
+
+        if amount <= 0:  # Check if amount is valid
+            return jsonify(generateReturnDictionary(304, "Invalid loan amount"))  # Invalid amount
+
+        changeAccount(username, amount, amount)  # Add amount to user's cash and debt
+        changeAccount("BANK", -amount)  # Deduct amount from bank's cash
+
+        return jsonify(generateReturnDictionary(200, "Loan taken successfully"))
+
+class PayLoan(Resource):  # Define PayLoan resource
+    def post(self):
+        # Get posted data from request
+        postedData = request.get_json()  # Get JSON data from request
+        username = postedData['username']
+        password = postedData['password']
+        amount = int(postedData['amount'])  # Accept "200" or 200 in the JSON body
+
+        retJson, error = verifyCredentials(username, password)  # Verify user credentials
+        if error:
+            return jsonify(retJson)  # Return error if credentials are invalid
+
+        if amount <= 0:  # Check if amount is valid
+            return jsonify(generateReturnDictionary(304, "Invalid payment amount"))  # Invalid amount
+
+        cash = cashWithUser(username)  # Get user's cash
+        debt = debtWithUser(username)  # Get user's debt
+
+        if amount > debt:  # Paying more than owed would leave a negative debt
+            return jsonify(generateReturnDictionary(307, "Payment exceeds the loan debt"))  # Overpayment
+
+        if cash < amount:  # Check if user has enough cash to pay loan
+            return jsonify(generateReturnDictionary(303, "Insufficient funds to pay loan"))  # Insufficient funds
+
+        changeAccount(username, -amount, -amount)  # Deduct amount from user's cash and debt
+        changeAccount("BANK", amount)  # Add amount to bank's cash
+
+        return jsonify(generateReturnDictionary(200, "Loan paid successfully"))
 
 api.add_resource(Register, '/register')  # Add Register resource to API
-api.add_resource(Classify, '/classify')  # Add Detect resource to API
-api.add_resource(Refill, '/refill')  # Add Refill resource to API   
+api.add_resource(Add, '/add')  # Add Add resource to API
+api.add_resource(Transfer, '/transfer')  # Add Transfer resource to API
+api.add_resource(Balance, '/balance')  # Add Balance resource to API
+api.add_resource(TakeLoan, '/takeloan')  # Add TakeLoan resource to API
+api.add_resource(PayLoan, '/payloan')  # Add PayLoan resource to API
 
-if __name__ == "__main__":  # 
+if __name__ == "__main__":  #
     app.run(host='0.0.0.0', port=5000)
